@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-deployment
+  labels:
+    app: app
+spec:
+  minReadySeconds: 5
+  replicas: 10
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      containers:
+      - name: app
+        image: app:good
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+          name: web
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: app
+  labels:
+    app: app
+spec:
+  selector:
+    app: app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+    name: web
+  type: NodePort
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: app
+  labels:
+    app: app
+spec:
+  selector:
+    matchLabels:
+      app: app
+  endpoints:
+  - port: web
