@@ -1,10 +1,9 @@
 import aiohttp
 import asyncio
+import sys
 
 import itertools
 import collections
-
-url = "http://192.168.99.100:30920"
 
 batch_size = 1000
 sleep_time = 1
@@ -27,5 +26,6 @@ async def main():
         await run_batch()
         await asyncio.sleep(sleep_time)
 
+url = sys.argv[1]
 loop = asyncio.get_event_loop()
 loop.run_until_complete(main())

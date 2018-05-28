@@ -1,0 +1,181 @@
+* Summary
+A prototype for how we could do canarying.
+
+The basic idea is that we use a CRD (Custom Resource Definition) and a
+Controller/Operator. The CRD defines what the canary should look like. Engineers
+create canary CRDs, specifying:
+- What the deployment for the canary should look like. This is just a normal
+  Kubernetes deployment template. The template is the desired deployment that should
+  take place after a successful canary (more on this later).
+- What type of metrics are to be used to decide whether to continue with the
+  canary. Currently only HTTP error rates are implemented, but this should be easily
+  extensible. Currently metrics are read off Prometheus. We could change this to
+  support Datadog or anything we want, of course.
+
+Engineers then submit the canary CRD to Kubernetes. `canary.yaml` contains an
+example canary file.
+
+The Controller/Operator constantly checks whether any new canaries have been
+submitted to Kubernetes. When it finds one, it takes the deployment template from the
+canary and makes a few modifications. For instance, it sets the "tier" tag to
+"canary" and appends "-canary" to the name so that the canary can be distinguished
+from a normal deployment. Additionally, it makes sure only one replica is created in
+the deployment. It then gives the replica some time (currently hardcoded to 60
+seconds) to receive traffic, and after that time passes then checks whether the
+metrics specified by the engineer are successful, e.g. whether the HTTP error rate is
+low enough. If this is the case, the controller/operator replaces the original
+deployment with the one that was used in the canary.
+
+The controller code is in `lib/canary/canary.py`.
+
+Bundled are two applications that expose metrics to Prometheus. They simply take HTTP
+requests (for path "/") and respond with either HTTP 200 OK or HTTP 500 Internal
+Server Error for the good and bad applications respectively. The bad application is
+supposed to simulate a broken release being pushed. The code for the applications is
+under `app_good` and `app_bad`.
+
+A client that hits these applications with 1000 requests per second is also
+bundled. The source code for it is under `client`.
+* Try it out
+** Install pipenv
+I use pipenv for Python dependency management. Install it through your package
+manager. Or don't, but you'll have to figure out what dependencies you need by
+yourself.
+** Start your Kubernetes cluster
+I use minikube, you can use whatever you want. You just need a Kubernetes cluster
+running.
+** Get Prometheus running
+Run the following:
+#+begin_src sh
+kubectl apply -f ./prometheus/rbac.yaml
+kubectl apply -f ./prometheus/prometheus.yaml
+#+end_src
+
+This will start a Prometheus instance on your cluster that will scrape your
+application for metrics.
+
+If you're using minikube, you can access the Prometheus UI through
+#+begin_src sh
+minikube service prometheus
+#+end_src
+
+** Build the application containers
+Run the following:
+
+#+begin_src sh
+docker build -t app:good app_good
+docker build -t app:bad app_bad
+#+end_src
+
+Make sure these images are available within your Kubernetes cluster. If using
+minikube, you can run
+#+begin_src sh
+eval $(minikube docker-env)
+#+end_src
+
+*before building* to have your instances built using minikube's docker.
+
+** Deploy the application
+
+Run the following
+
+#+begin_src sh
+kubectl apply -f ./deployment.yaml
+#+end_src
+
+This will deploy 10 replicas of the application, a service, and a Prometheus service
+monitor (which just tells Prometheus to scrape the application's pods for metrics).
+
+** Get the URL for the application's service
+If you're using minikube, this can be done through
+#+begin_src sh
+minikube service app
+#+end_src
+If you aren't using minikube:
+#+begin_src sh
+kubectl describe service app
+#+end_src
+should provide it.
+** Run the application client
+Run the following, replacing <url> with the URL obtained in the previous step. Do
+this in another terminal tab.
+#+begin_src sh
+cd ./client
+pipenv shell
+python ./client.py <url>
+#+end_src
+
+The client will start sending requests to your app. You should see a breakdown of the
+HTTP response codes printed to your terminal every second.
+
+At this point, you should see metrics coming into Prometheus.
+** Create the Canary CRD
+Back to your main terminal tab!
+
+This uses a custom resource, which you must register with the Kubernetes cluster.
+
+#+begin_src sh
+kubectl apply -f ./lib/canary/crd.yaml
+#+end_src
+
+** Run the canary controller
+
+Start the canary controller. Do this in another terminal tab, as it's a daemon:
+#+begin_src sh
+pipenv shell
+python ./lib/canary/canary.py
+#+end_src
+
+** Run a canary using a "good" application
+Simply run the following:
+#+begin_src sh
+kubectl apply -f ./canary.yaml
+#+end_src
+
+And look at the output of the canary controller. It will wait for 60 seconds to get
+some metrics, and then continue with the canary. Your deployment should get updated
+because the canary was successful.
+
+When it's done, delete the canary:
+#+begin_src sh
+kubectl delete -f ./canary.yaml
+#+end_src
+
+** Run a canary with a "bad" application
+Modify the canary.yaml file and change the image from app:good to app:bad, then run the following:
+#+begin_src sh
+kubectl apply -f ./canary.yaml
+#+end_src
+
+And look at the output of the canary controller. Your deployment should *not* get
+updated because the canary was unsuccessful.
+
+When you're done, delete the canary again:
+#+begin_src sh
+kubectl delete -f ./canary.yaml
+#+end_src
+
+Feel free to try running another good canary now. It should still work.
+
+During both canaries, your client should have continued running without any
+issues. During the bad canary, you should see the HTTP error rate be nonzero, but it
+should fix itself automatically.
+
+* Caveats and possible improvements
+** Metrics
+Metrics are written as Python classes. If the controller/operator runs in the
+cluster, it'll be hard for applications to define custom metrics. We have to make the
+metrics flexible enough that they cover all of our needs. Basically, as long as we
+can express our needs in YAML and Python, we're good, but I think we'll need to write
+a YAML DSL if we want powerful and flexible queries.
+
+An alternative is requiring applications with "nonstandard" metrics to write a
+Kubernetes Job that will signal success if the canary should proceed. The controller
+would start that Job, check its result, and react accordingly. This would be
+extremely flexible, but perhaps very tedious. On the other hand, we should cover the
+most common cases through metrics such as HttpErrorRate.
+** Run the controller/operator in the cluster
+Currently it's run outside the cluster, so there's very little benefit to using the
+operator/controller model.
+** Clean up controller code
+It's just a proof of concept, if this goes any further, that code needs some love
